@@ -39,6 +39,9 @@ use librespot::playback::mixer::alsamixer::AlsaMixer;
 mod player_event_handler;
 use player_event_handler::{run_program_on_sink_events, EventHandler};
 
+mod mqtt_event_handler;
+use mqtt_event_handler::MQTTHandler;
+
 fn device_id(name: &str) -> String {
     HEXLOWER.encode(&Sha1::digest(name.as_bytes()))
 }
@@ -199,6 +202,12 @@ static OAUTH_SCOPES: &[&str] = &[
     "user-top-read",
 ];
 
+struct Mqtt {
+    create_opts: paho_mqtt::CreateOptions,
+    conn_opts: paho_mqtt::ConnectOptions,
+    message_topic: String,
+}
+
 struct Setup {
     format: AudioFormat,
     backend: SinkBuilder,
@@ -217,6 +226,7 @@ struct Setup {
     player_event_program: Option<String>,
     emit_sink_events: bool,
     zeroconf_ip: Vec<std::net::IpAddr>,
+    mqtt: Option<Mqtt>,
 }
 
 fn get_setup() -> Setup {
@@ -277,6 +287,12 @@ fn get_setup() -> Setup {
     const VOLUME_RANGE: &str = "volume-range";
     const ZEROCONF_PORT: &str = "zeroconf-port";
     const ZEROCONF_INTERFACE: &str = "zeroconf-interface";
+
+    const MQTT_SERVER_URI: &str = "mqtt-server-uri";
+    const MQTT_USER_NAME: &str = "mqtt-username";
+    const MQTT_PASSWORD: &str = "mqtt-password";
+    const MQTT_CLIENT_ID: &str = "mqtt-client-id";
+    const MQTT_TOPIC: &str = "mqtt-topic";
 
     // Mostly arbitrary.
     const AP_PORT_SHORT: &str = "a";
@@ -638,6 +654,37 @@ fn get_setup() -> Setup {
         ZEROCONF_INTERFACE,
         "Comma-separated interface IP addresses on which zeroconf will bind. Defaults to all interfaces. Ignored by DNS-SD.",
         "IP"
+    )
+    .optopt(
+        "",
+        MQTT_SERVER_URI,
+        "Sets the the URI to the MQTT broker. The URI string to specify the server in the form protocol://host:port, where the protocol can be tcp or ssl, and the host can be an IP address or domain name.",
+        "MQTT URI"
+    )
+    .optopt(
+            "",
+            MQTT_USER_NAME,
+            "Sets the user name for authentication with the broker. This works with the password.",
+            "MQTT USER"
+    )
+    .optopt(
+            "",
+            MQTT_PASSWORD,
+            "Sets the password for authentication with the broker. This works with the user name.",
+            "MQTT PASS"
+
+    )
+    .optopt(
+            "",
+            MQTT_CLIENT_ID,
+            "Sets the client identifier string that is sent to the server. The client ID is a unique name to identify the client to the server, which can be used if the client desires the server to hold state about the session. If the client requests a clean session, this can be an empty string, in which case the server will assign a random name for the client.",
+            "MQTT ID"
+    )
+    .optopt(
+            "",
+            MQTT_TOPIC,
+            "Sets the topic for the generated messages. Defaults to libraspot/events",
+            "MQTT TOP"
     );
 
     #[cfg(feature = "passthrough-decoder")]
@@ -1721,6 +1768,38 @@ fn get_setup() -> Setup {
     let player_event_program = opt_str(ONEVENT);
     let emit_sink_events = opt_present(EMIT_SINK_EVENTS);
 
+    let mqtt = if let Some(mqtt_uri) = opt_str(MQTT_SERVER_URI) {
+            let create_opts = paho_mqtt::CreateOptionsBuilder::new()
+                .server_uri(mqtt_uri)
+                .allow_disconnected_send_at_anytime(true)
+                .send_while_disconnected(true)
+                .max_buffered_messages(10)
+                .delete_oldest_messages(true)
+                .client_id(opt_str(MQTT_CLIENT_ID).unwrap_or_else(|| "".to_string()))
+                .finalize();
+
+            let mut conn_opts_builder = paho_mqtt::ConnectOptionsBuilder::new();
+            let mut conn_opts_builder =  conn_opts_builder
+                .keep_alive_interval(Duration::from_secs(20))
+                .automatic_reconnect(Duration::from_millis(1), Duration::from_secs(24 * 60 * 60))
+                .clean_session(true);
+            if let (Some(user_name), Some(password)) = (opt_str(MQTT_USER_NAME), opt_str(MQTT_PASSWORD)) {
+                conn_opts_builder = conn_opts_builder.user_name(user_name).password(password);
+            };
+
+            let conn_opts = conn_opts_builder.finalize();
+
+            let message_topic =
+                { opt_str(MQTT_TOPIC).unwrap_or_else(|| "librespot".to_string()) };
+
+            Some(Mqtt {
+                create_opts,
+                conn_opts,
+                message_topic,
+            })
+
+        } else {None};
+
     Setup {
         format,
         backend,
@@ -1739,6 +1818,7 @@ fn get_setup() -> Setup {
         player_event_program,
         emit_sink_events,
         zeroconf_ip,
+        mqtt
     }
 }
 
@@ -1859,6 +1939,11 @@ async fn main() {
         }
     }
 
+    let mut _mqtt_handler = None;
+    if let Some(mqtt) = setup.mqtt {
+        _mqtt_handler = Some(MQTTHandler::new(mqtt.create_opts, mqtt.conn_opts, mqtt.message_topic))
+    }
+
     loop {
         tokio::select! {
             credentials = async {
@@ -1912,6 +1997,11 @@ async fn main() {
                         exit(1);
                     }
                 };
+
+                if let Some(mut _handler) = _mqtt_handler.clone() {
+                    _handler.run(player.get_player_event_channel(), spirc_.get_spirc_command_channel());
+                }
+
                 spirc = Some(spirc_);
                 spirc_task = Some(Box::pin(spirc_task_));
 
@@ -1956,7 +2046,7 @@ async fn main() {
     info!("Gracefully shutting down");
 
     // Shutdown spirc if necessary
-    if let Some(spirc) = spirc {
+    if let Some(spirc) = &spirc {
         if let Err(e) = spirc.shutdown() {
             error!("error sending spirc shutdown message: {}", e);
         }

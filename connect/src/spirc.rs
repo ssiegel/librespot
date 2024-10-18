@@ -12,6 +12,7 @@ use protobuf::Message;
 use rand::prelude::SliceRandom;
 use thiserror::Error;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::{
@@ -124,6 +125,26 @@ pub enum SpircCommand {
     SetVolume(u16),
     Activate,
     Load(SpircLoadCommand),
+}
+
+impl TryFrom<&str> for SpircCommand {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        use SpircCommand::*;
+        match value {
+            "play" => Ok(Play),
+            "play_pause" => Ok(PlayPause),
+            "pause" => Ok(Pause),
+            "prev" => Ok(Prev),
+            "next" => Ok(Next),
+            "volume_up" => Ok(VolumeUp),
+            "volume_down" => Ok(VolumeDown),
+            "shutdown" => Ok(Shutdown),
+            "disconnect" => Ok(Disconnect),
+            "activate" => Ok(Activate),
+            _ => Err(format!("Can't parse command {}", value)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -443,6 +464,10 @@ impl Spirc {
     }
     pub fn load(&self, command: SpircLoadCommand) -> Result<(), Error> {
         Ok(self.commands.send(SpircCommand::Load(command))?)
+    }
+
+    pub fn get_spirc_command_channel(&self) -> UnboundedSender<SpircCommand> {
+        self.commands.clone()
     }
 }
 

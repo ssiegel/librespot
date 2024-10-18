@@ -1,3 +1,8 @@
+use futures_util::{
+    future, future::FusedFuture, stream::futures_unordered::FuturesUnordered, StreamExt,
+    TryFutureExt,
+};
+use parking_lot::Mutex;
 use std::{
     collections::HashMap,
     fmt,
@@ -14,12 +19,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-use futures_util::{
-    future, future::FusedFuture, stream::futures_unordered::FuturesUnordered, StreamExt,
-    TryFutureExt,
-};
-use parking_lot::Mutex;
 use symphonia::core::io::MediaSource;
 use tokio::sync::{mpsc, oneshot};
 
@@ -260,6 +259,124 @@ impl PlayerEvent {
                 play_request_id, ..
             } => Some(*play_request_id),
             _ => None,
+        }
+    }
+
+    pub fn get_player_event_fields(&self) -> Result<HashMap<&'static str, String>, Error> {
+        use PlayerEvent::*;
+        let mut fields = HashMap::new();
+        let player_event: &str = self.into();
+        fields.insert("player_event", player_event.to_string());
+        match self {
+            PlayRequestIdChanged { .. } => (),
+            Stopped { track_id, .. }
+            | Preloading { track_id }
+            | TimeToPreloadNextTrack { track_id, .. }
+            | EndOfTrack { track_id, .. }
+            | Unavailable { track_id, .. } => {
+                let item_type: &str = track_id.item_type.into();
+                fields.insert("audio_type", item_type.to_string());
+                fields.insert("track_id", track_id.to_base62()?);
+            }
+            Loading {
+                track_id,
+                position_ms,
+                ..
+            }
+            | Playing {
+                track_id,
+                position_ms,
+                ..
+            }
+            | Paused {
+                track_id,
+                position_ms,
+                ..
+            }
+            | PositionCorrection {
+                track_id,
+                position_ms,
+                ..
+            }
+            | Seeked {
+                track_id,
+                position_ms,
+                ..
+            } => {
+                let audio_type: &str = track_id.item_type.into();
+                fields.insert("audio_type", audio_type.to_string());
+                fields.insert("track_id", track_id.to_base62()?);
+                fields.insert("position_ms", position_ms.to_string());
+            }
+            VolumeChanged { volume } => {
+                fields.insert("volume", volume.to_string());
+            }
+            TrackChanged { audio_item } => {
+                fields.insert("track_id", audio_item.track_id.to_string());
+            }
+            SessionConnected {
+                connection_id,
+                user_name,
+            }
+            | SessionDisconnected {
+                connection_id,
+                user_name,
+            } => {
+                fields.insert("connection_id", connection_id.to_string());
+                fields.insert("user_name", user_name.to_string());
+            }
+            SessionClientChanged {
+                client_id,
+                client_name,
+                client_brand_name,
+                client_model_name,
+            } => {
+                fields.insert("client_id", client_id.to_string());
+                fields.insert("client_name", client_name.to_string());
+                fields.insert("client_brand_name", client_brand_name.to_string());
+                fields.insert("client_model_name", client_model_name.to_string());
+            }
+            ShuffleChanged { shuffle } => {
+                fields.insert("shuffle", shuffle.to_string());
+            }
+            RepeatChanged { repeat } => {
+                fields.insert("shuffle", repeat.to_string());
+            }
+            AutoPlayChanged { auto_play } => {
+                fields.insert("shuffle", auto_play.to_string());
+            }
+            FilterExplicitContentChanged { filter } => {
+                fields.insert("shuffle", filter.to_string());
+            }
+        };
+        Ok(fields)
+    }
+}
+
+impl From<&PlayerEvent> for &str {
+    fn from(player_event: &PlayerEvent) -> &'static str {
+        use crate::player::PlayerEvent::*;
+        match player_event {
+            PlayRequestIdChanged { .. } => "play_request_id_changed",
+            Stopped { .. } => "stopped",
+            Loading { .. } => "loading",
+            Preloading { .. } => "preloading",
+            Playing { .. } => "playing",
+            Paused { .. } => "paused",
+            TimeToPreloadNextTrack { .. } => "time_to_preload_next_track",
+            EndOfTrack { .. } => "end_of_track",
+            Unavailable { .. } => "unavailable",
+            VolumeChanged { .. } => "volume_changed",
+            PositionCorrection { .. } => "position_correction",
+            Seeked { .. } => "seeked",
+            TrackChanged { .. } => "track_changed",
+            SessionConnected { .. } => "session_connected",
+            SessionDisconnected { .. } => "session_disconnected",
+            SessionClientChanged { .. } => "session_client_changed",
+            ShuffleChanged { .. } => "shuffle_changed",
+            RepeatChanged { .. } => "repeat_changed",
+            AutoPlayChanged { .. } => "auto_play_changed",
+            FilterExplicitContentChanged { .. } => "filter_explicit_content_changed",
         }
     }
 }

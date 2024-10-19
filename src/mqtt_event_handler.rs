@@ -23,7 +23,7 @@ impl MQTTHandler {
 
         let mqtt_client = paho_mqtt::AsyncClient::new(create_opts).unwrap();
         let cloned_topic = topic.clone();
-        mqtt_client.set_connected_callback(|mqtt_client| { mqtt_client.subscribe(format!("{}/sub", cloned_topic), Self::QOS); });
+        mqtt_client.set_connected_callback(move |mqtt_client| { mqtt_client.subscribe(format!("{}/sub", cloned_topic), Self::QOS); });
         mqtt_client.connect(conn_opts);
 
 

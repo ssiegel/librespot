@@ -26,6 +26,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
+use crate::dealer::manager::DealerManager;
 use crate::{
     apresolve::{ApResolver, SocketAddress},
     audio_key::AudioKeyManager,
@@ -100,6 +101,7 @@ struct SessionInternal {
     audio_key: OnceCell<AudioKeyManager>,
     channel: OnceCell<ChannelManager>,
     mercury: OnceCell<MercuryManager>,
+    dealer: OnceCell<DealerManager>,
     spclient: OnceCell<SpClient>,
     token_provider: OnceCell<TokenProvider>,
     login5: OnceCell<Login5Manager>,
@@ -141,6 +143,7 @@ impl Session {
             audio_key: OnceCell::new(),
             channel: OnceCell::new(),
             mercury: OnceCell::new(),
+            dealer: OnceCell::new(),
             spclient: OnceCell::new(),
             token_provider: OnceCell::new(),
             login5: OnceCell::new(),
@@ -301,6 +304,12 @@ impl Session {
         self.0
             .mercury
             .get_or_init(|| MercuryManager::new(self.weak()))
+    }
+
+    pub fn dealer(&self) -> &DealerManager {
+        self.0
+            .dealer
+            .get_or_init(|| DealerManager::new(self.weak()))
     }
 
     pub fn spclient(&self) -> &SpClient {

@@ -122,7 +122,10 @@ enum PlayerCommand {
     },
     EmitFilterExplicitContentChangedEvent(bool),
     EmitShuffleChangedEvent(bool),
-    EmitRepeatChangedEvent(bool),
+    EmitRepeatChangedEvent {
+        context: bool,
+        track: bool,
+    },
     EmitAutoPlayChangedEvent(bool),
 }
 
@@ -217,7 +220,8 @@ pub enum PlayerEvent {
         shuffle: bool,
     },
     RepeatChanged {
-        repeat: bool,
+        context: bool,
+        track: bool,
     },
     AutoPlayChanged {
         auto_play: bool,
@@ -339,14 +343,15 @@ impl PlayerEvent {
             ShuffleChanged { shuffle } => {
                 fields.insert("shuffle", shuffle.to_string());
             }
-            RepeatChanged { repeat } => {
-                fields.insert("shuffle", repeat.to_string());
+            RepeatChanged { context, track } => {
+                fields.insert("context", context.to_string());
+                fields.insert("track", track.to_string());
             }
             AutoPlayChanged { auto_play } => {
-                fields.insert("shuffle", auto_play.to_string());
+                fields.insert("auto_play", auto_play.to_string());
             }
             FilterExplicitContentChanged { filter } => {
-                fields.insert("shuffle", filter.to_string());
+                fields.insert("filter_explicit", filter.to_string());
             }
         };
         Ok(fields)
@@ -724,8 +729,8 @@ impl Player {
         self.command(PlayerCommand::EmitShuffleChangedEvent(shuffle));
     }
 
-    pub fn emit_repeat_changed_event(&self, repeat: bool) {
-        self.command(PlayerCommand::EmitRepeatChangedEvent(repeat));
+    pub fn emit_repeat_changed_event(&self, context: bool, track: bool) {
+        self.command(PlayerCommand::EmitRepeatChangedEvent { context, track });
     }
 
     pub fn emit_auto_play_changed_event(&self, auto_play: bool) {
@@ -2221,8 +2226,8 @@ impl PlayerInternal {
                 self.send_event(PlayerEvent::VolumeChanged { volume })
             }
 
-            PlayerCommand::EmitRepeatChangedEvent(repeat) => {
-                self.send_event(PlayerEvent::RepeatChanged { repeat })
+            PlayerCommand::EmitRepeatChangedEvent { context, track } => {
+                self.send_event(PlayerEvent::RepeatChanged { context, track })
             }
 
             PlayerCommand::EmitShuffleChangedEvent(shuffle) => {
@@ -2453,9 +2458,10 @@ impl fmt::Debug for PlayerCommand {
                 .debug_tuple("EmitShuffleChangedEvent")
                 .field(&shuffle)
                 .finish(),
-            PlayerCommand::EmitRepeatChangedEvent(repeat) => f
+            PlayerCommand::EmitRepeatChangedEvent { context, track } => f
                 .debug_tuple("EmitRepeatChangedEvent")
-                .field(&repeat)
+                .field(&context)
+                .field(&track)
                 .finish(),
             PlayerCommand::EmitAutoPlayChangedEvent(auto_play) => f
                 .debug_tuple("EmitAutoPlayChangedEvent")

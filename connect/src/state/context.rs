@@ -1,14 +1,21 @@
-use crate::state::consts::METADATA_ENTITY_URI;
-use crate::state::provider::Provider;
-use crate::state::{ConnectState, StateError, METADATA_CONTEXT_URI};
+use crate::state::{metadata::Metadata, provider::Provider, ConnectState, StateError};
 use librespot_core::{Error, SpotifyId};
-use librespot_protocol::player::{Context, ContextIndex, ContextPage, ContextTrack, ProvidedTrack};
+use librespot_protocol::player::{
+    Context, ContextIndex, ContextPage, ContextTrack, ProvidedTrack, Restrictions,
+};
+use protobuf::MessageField;
 use std::collections::HashMap;
+use uuid::Uuid;
+
+const LOCAL_FILES_IDENTIFIER: &str = "spotify:local-files";
+const SEARCH_IDENTIFIER: &str = "spotify:search";
 
 #[derive(Debug, Clone)]
 pub struct StateContext {
     pub tracks: Vec<ProvidedTrack>,
     pub metadata: HashMap<String, String>,
+    pub restrictions: Option<Restrictions>,
+    /// is used to keep track which tracks are already loaded into the next_tracks
     pub index: ContextIndex,
 }
 
@@ -26,6 +33,18 @@ pub enum LoadNext {
     Empty,
 }
 
+#[derive(Debug)]
+pub enum UpdateContext {
+    Default,
+    Autoplay,
+}
+
+pub enum ResetContext<'s> {
+    Completely,
+    DefaultIndex,
+    WhenDifferent(&'s str),
+}
+
 impl ConnectState {
     pub fn find_index_in_context<F: Fn(&ProvidedTrack) -> bool>(
         context: Option<&StateContext>,
@@ -41,44 +60,99 @@ impl ConnectState {
             .ok_or(StateError::CanNotFindTrackInContext(None, ctx.tracks.len()))
     }
 
-    pub(super) fn get_current_context(&self) -> Result<&StateContext, StateError> {
-        match self.active_context {
+    pub(super) fn get_context(&self, ty: &ContextType) -> Result<&StateContext, StateError> {
+        match ty {
             ContextType::Default => self.context.as_ref(),
             ContextType::Shuffle => self.shuffle_context.as_ref(),
             ContextType::Autoplay => self.autoplay_context.as_ref(),
         }
-        .ok_or(StateError::NoContext(self.active_context))
+        .ok_or(StateError::NoContext(*ty))
     }
 
     pub fn context_uri(&self) -> &String {
-        &self.player.context_uri
+        &self.player().context_uri
     }
 
-    pub fn reset_context(&mut self, new_context: Option<&str>) {
-        self.active_context = ContextType::Default;
+    pub fn reset_context(&mut self, mut reset_as: ResetContext) {
+        self.set_active_context(ContextType::Default);
+        self.fill_up_context = ContextType::Default;
 
-        self.autoplay_context = None;
+        if matches!(reset_as, ResetContext::WhenDifferent(ctx) if self.context_uri() != ctx) {
+            reset_as = ResetContext::Completely
+        }
         self.shuffle_context = None;
 
-        if matches!(new_context, Some(ctx) if self.player.context_uri != ctx) {
-            self.context = None;
-        } else if let Some(ctx) = self.context.as_mut() {
-            ctx.index.track = 0;
-            ctx.index.page = 0;
+        match reset_as {
+            ResetContext::Completely => {
+                self.context = None;
+                self.autoplay_context = None;
+                self.next_contexts.clear();
+            }
+            ResetContext::WhenDifferent(_) => debug!("context didn't change, no reset"),
+            ResetContext::DefaultIndex => {
+                for ctx in [self.context.as_mut(), self.autoplay_context.as_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    ctx.index.track = 0;
+                    ctx.index.page = 0;
+                }
+            }
         }
 
         self.update_restrictions()
     }
 
-    pub fn update_context(&mut self, context: Context) -> Result<(), Error> {
-        debug!("context: {}, {}", context.uri, context.url);
+    pub fn get_context_uri_from_context(context: &Context) -> Option<&String> {
+        if !context.uri.starts_with(SEARCH_IDENTIFIER) {
+            return Some(&context.uri);
+        }
 
+        context
+            .pages
+            .first()
+            .and_then(|p| p.tracks.first().map(|t| &t.uri))
+    }
+
+    pub fn set_active_context(&mut self, new_context: ContextType) {
+        self.active_context = new_context;
+
+        let ctx = match self.get_context(&new_context) {
+            Err(why) => {
+                debug!("couldn't load context info because: {why}");
+                return;
+            }
+            Ok(ctx) => ctx,
+        };
+
+        let mut restrictions = ctx.restrictions.clone();
+        let metadata = ctx.metadata.clone();
+
+        let player = self.player_mut();
+
+        player.context_metadata.clear();
+        player.restrictions.clear();
+
+        if let Some(restrictions) = restrictions.take() {
+            player.restrictions = MessageField::some(restrictions);
+        }
+
+        for (key, value) in metadata {
+            player.context_metadata.insert(key, value);
+        }
+    }
+
+    pub fn update_context(&mut self, mut context: Context, ty: UpdateContext) -> Result<(), Error> {
         if context.pages.iter().all(|p| p.tracks.is_empty()) {
             error!("context didn't have any tracks: {context:#?}");
             return Err(StateError::ContextHasNoTracks.into());
+        } else if context.uri.starts_with(LOCAL_FILES_IDENTIFIER) {
+            return Err(StateError::UnsupportedLocalPlayBack.into());
         }
 
-        self.next_contexts.clear();
+        if matches!(ty, UpdateContext::Default) {
+            self.next_contexts.clear();
+        }
 
         let mut first_page = None;
         for page in context.pages {
@@ -90,66 +164,87 @@ impl ConnectState {
         }
 
         let page = match first_page {
-            None => return Err(StateError::ContextHasNoTracks.into()),
+            None => Err(StateError::ContextHasNoTracks)?,
             Some(p) => p,
         };
 
-        if context.restrictions.is_some() {
-            self.player.restrictions = context.restrictions.clone();
-            self.player.context_restrictions = context.restrictions;
-        } else {
-            self.player.context_restrictions = Default::default();
-            self.player.restrictions = Default::default()
-        }
+        let prev_context = match ty {
+            UpdateContext::Default => self.context.as_ref(),
+            UpdateContext::Autoplay => self.autoplay_context.as_ref(),
+        };
 
-        self.player.context_metadata.clear();
-        for (key, value) in context.metadata {
-            self.player.context_metadata.insert(key, value);
-        }
-
-        self.update_context_from_page(page, Some(&context.uri), None);
-
-        self.player.context_url = format!("context://{}", &context.uri);
-        self.player.context_uri = context.uri;
-
-        Ok(())
-    }
-
-    pub fn update_autoplay_context(&mut self, mut context: Context) -> Result<(), Error> {
         debug!(
-            "autoplay-context: {}, pages: {}",
+            "updated context {ty:?} from <{}> ({} tracks) to <{}> ({} tracks)",
+            self.context_uri(),
+            prev_context
+                .map(|c| c.tracks.len().to_string())
+                .unwrap_or_else(|| "-".to_string()),
             context.uri,
-            context.pages.len()
-        );
-
-        let page = context
-            .pages
-            .pop()
-            .ok_or(StateError::NoContext(ContextType::Autoplay))?;
-        debug!("autoplay-context size: {}", page.tracks.len());
-
-        self.update_context_from_page(page, Some(&context.uri), Some(Provider::Autoplay));
-
-        Ok(())
-    }
-
-    pub fn update_context_from_page(
-        &mut self,
-        page: ContextPage,
-        new_context_uri: Option<&str>,
-        provider: Option<Provider>,
-    ) {
-        let new_context_uri = new_context_uri.unwrap_or(&self.player.context_uri);
-        debug!(
-            "updated context from {} ({} tracks) to {} ({} tracks)",
-            self.player.context_uri,
-            self.context
-                .as_ref()
-                .map(|c| c.tracks.len())
-                .unwrap_or_default(),
-            new_context_uri,
             page.tracks.len()
         );
+
+        match ty {
+            UpdateContext::Default => {
+                let mut new_context = self.state_context_from_page(
+                    page,
+                    context.restrictions.take(),
+                    Some(&context.uri),
+                    None,
+                );
+
+                // when we update the same context, we should try to preserve the previous position
+                // otherwise we might load the entire context twice
+                if !self.context_uri().contains(SEARCH_IDENTIFIER)
+                    && self.context_uri() == &context.uri
+                {
+                    match Self::find_index_in_context(Some(&new_context), |t| {
+                        self.current_track(|t| &t.uri) == &t.uri
+                    }) {
+                        Ok(new_pos) => {
+                            debug!("found new index of current track, updating new_context index to {new_pos}");
+                            new_context.index.track = (new_pos + 1) as u32;
+                        }
+                        // the track isn't anymore in the context
+                        Err(_) if matches!(self.active_context, ContextType::Default) => {
+                            warn!("current track was removed, setting pos to last known index");
+                            new_context.index.track = self.player().index.track
+                        }
+                        Err(_) => {}
+                    }
+                    // enforce reloading the context
+                    self.clear_next_tracks(true);
+                }
+
+                self.context = Some(new_context);
+
+                if !context.url.contains(SEARCH_IDENTIFIER) {
+                    self.player_mut().context_url = context.url;
+                } else {
+                    self.player_mut().context_url.clear()
+                }
+                self.player_mut().context_uri = context.uri;
+            }
+            UpdateContext::Autoplay => {
+                self.autoplay_context = Some(self.state_context_from_page(
+                    page,
+                    context.restrictions.take(),
+                    Some(&context.uri),
+                    Some(Provider::Autoplay),
+                ))
+            }
+        }
+
+        Ok(())
+    }
+
+    fn state_context_from_page(
+        &mut self,
+        page: ContextPage,
+        restrictions: Option<Restrictions>,
+        new_context_uri: Option<&str>,
+        provider: Option<Provider>,
+    ) -> StateContext {
+        let new_context_uri = new_context_uri.unwrap_or(self.context_uri());
 
         let tracks = page
             .tracks
@@ -158,51 +253,67 @@ impl ConnectState {
                 match self.context_to_provided_track(track, Some(new_context_uri), provider.clone())
                 {
                     Ok(t) => Some(t),
-                    Err(_) => {
-                        error!("couldn't convert {track:#?} into ProvidedTrack");
+                    Err(why) => {
+                        error!("couldn't convert {track:#?} into ProvidedTrack: {why}");
                         None
                     }
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        self.context = Some(StateContext {
+        StateContext {
             tracks,
+            restrictions,
             metadata: page.metadata,
             index: ContextIndex::new(),
-        })
+        }
     }
 
     pub fn merge_context(&mut self, context: Option<Context>) -> Option<()> {
         let mut context = context?;
-        if context.uri != self.player.context_uri {
+        if self.context_uri() != &context.uri {
             return None;
         }
 
-        let mutable_context = self.context.as_mut()?;
-        let page = context.pages.pop()?;
-        for track in page.tracks {
-            if track.uid.is_empty() || track.uri.is_empty() {
+        let current_context = self.context.as_mut()?;
+        let new_page = context.pages.pop()?;
+
+        for new_track in new_page.tracks {
+            if new_track.uri.is_empty() {
                 continue;
             }
 
             if let Ok(position) =
-                Self::find_index_in_context(Some(mutable_context), |t| t.uri == track.uri)
+                Self::find_index_in_context(Some(current_context), |t| t.uri == new_track.uri)
             {
-                mutable_context.tracks.get_mut(position)?.uid = track.uid
+                let context_track = current_context.tracks.get_mut(position)?;
+
+                for (key, value) in new_track.metadata {
+                    warn!("merging metadata {key} {value}");
+                    context_track.metadata.insert(key, value);
+                }
+
+                // the uid provided from another context might be actual uid of an item
+                if !new_track.uid.is_empty() {
+                    context_track.uid = new_track.uid;
+                }
             }
         }
 
         Some(())
     }
 
-    pub(super) fn update_context_index(&mut self, new_index: usize) -> Result<(), StateError> {
-        let context = match self.active_context {
+    pub(super) fn update_context_index(
+        &mut self,
+        ty: ContextType,
+        new_index: usize,
+    ) -> Result<(), StateError> {
+        let context = match ty {
             ContextType::Default => self.context.as_mut(),
             ContextType::Shuffle => self.shuffle_context.as_mut(),
             ContextType::Autoplay => self.autoplay_context.as_mut(),
         }
-        .ok_or(StateError::NoContext(self.active_context))?;
+        .ok_or(StateError::NoContext(ty))?;
 
         context.index.track = new_index as u32;
         Ok(())
@@ -214,50 +325,71 @@ impl ConnectState {
         context_uri: Option<&str>,
         provider: Option<Provider>,
     ) -> Result<ProvidedTrack, Error> {
-        let question_mark_idx = ctx_track
-            .uri
-            .contains('?')
-            .then(|| ctx_track.uri.find('?'))
-            .flatten();
+        let id = if !ctx_track.uri.is_empty() {
+            if ctx_track.uri.contains(['?', '%']) {
+                Err(StateError::InvalidTrackUri(ctx_track.uri.clone()))?
+            }
 
-        let ctx_track_uri = if let Some(idx) = question_mark_idx {
-            &ctx_track.uri[..idx]
+            SpotifyId::from_uri(&ctx_track.uri)?
+        } else if !ctx_track.gid.is_empty() {
+            SpotifyId::from_raw(&ctx_track.gid)?
         } else {
-            &ctx_track.uri
-        }
-        .to_string();
+            Err(StateError::InvalidTrackUri(String::new()))?
+        };
 
-        let provider = if self.unavailable_uri.contains(&ctx_track_uri) {
+        let provider = if self.unavailable_uri.contains(&ctx_track.uri) {
             Provider::Unavailable
         } else {
             provider.unwrap_or(Provider::Context)
         };
 
-        let id = if !ctx_track_uri.is_empty() {
-            SpotifyId::from_uri(&ctx_track_uri)
-        } else if !ctx_track.gid.is_empty() {
-            SpotifyId::from_raw(&ctx_track.gid)
+        // assumption: the uid is used as unique-id of any item
+        //  - queue resorting is done by each client and orients itself by the given uid
+        //  - if no uid is present, resorting doesn't work or behaves not as intended
+        let uid = if ctx_track.uid.is_empty() {
+            // so setting providing a unique id should allow to resort the queue
+            Uuid::new_v4().as_simple().to_string()
         } else {
-            return Err(Error::unavailable("track not available"));
-        }?;
+            ctx_track.uid.to_string()
+        };
 
         let mut metadata = HashMap::new();
-        if let Some(context_uri) = context_uri {
-            metadata.insert(METADATA_CONTEXT_URI.to_string(), context_uri.to_string());
-            metadata.insert(METADATA_ENTITY_URI.to_string(), context_uri.to_string());
-        }
-
         for (k, v) in &ctx_track.metadata {
             metadata.insert(k.to_string(), v.to_string());
         }
 
-        Ok(ProvidedTrack {
+        let mut track = ProvidedTrack {
             uri: id.to_uri()?.replace("unknown", "track"),
-            uid: ctx_track.uid.clone(),
+            uid,
             metadata,
             provider: provider.to_string(),
             ..Default::default()
-        })
+        };
+
+        if let Some(context_uri) = context_uri {
+            track.set_context_uri(context_uri.to_string());
+            track.set_entity_uri(context_uri.to_string());
+        }
+
+        if matches!(provider, Provider::Autoplay) {
+            track.set_autoplay(true)
+        }
+
+        Ok(track)
+    }
+
+    pub fn fill_context_from_page(&mut self, page: ContextPage) -> Result<(), Error> {
+        let context = self.state_context_from_page(page, None, None, None);
+        let ctx = self
+            .context
+            .as_mut()
+            .ok_or(StateError::NoContext(ContextType::Default))?;
+
+        for t in context.tracks {
+            ctx.tracks.push(t)
+        }
+
+        Ok(())
     }
 
     pub fn try_load_next_context(&mut self) -> Result<LoadNext, Error> {
@@ -267,10 +399,15 @@ impl ConnectState {
         };
 
         if next.tracks.is_empty() {
+            if next.page_url.is_empty() {
+                Err(StateError::NoContext(ContextType::Default))?
+            }
+
+            self.update_current_index(|i| i.page += 1);
             return Ok(LoadNext::PageUrl(next.page_url));
         }
 
-        self.update_context_from_page(next, None, None);
+        self.fill_context_from_page(next)?;
         self.fill_up_next_tracks()?;
 
         Ok(LoadNext::Done)

@@ -53,10 +53,17 @@ pub const CLIENT_TOKEN: HeaderName = HeaderName::from_static("client-token");
 #[allow(clippy::declare_interior_mutable_const)]
 const CONNECTION_ID: HeaderName = HeaderName::from_static("x-spotify-connection-id");
 
+const NO_METRICS_AND_SALT: RequestOptions = RequestOptions {
+    metrics: false,
+    salt: false,
+};
+
 #[derive(Debug, Error)]
 pub enum SpClientError {
     #[error("missing attribute {0}")]
     Attribute(String),
+    #[error("expected data but received none")]
+    NoData,
 }
 
 impl From<SpClientError> for Error {
@@ -74,6 +81,20 @@ pub enum RequestStrategy {
 impl Default for RequestStrategy {
     fn default() -> Self {
         RequestStrategy::TryTimes(10)
+    }
+}
+
+pub struct RequestOptions {
+    metrics: bool,
+    salt: bool,
+}
+
+impl Default for RequestOptions {
+    fn default() -> Self {
+        Self {
+            metrics: true,
+            salt: true,
+        }
     }
 }
 
@@ -356,6 +377,24 @@ impl SpClient {
         headers: Option<HeaderMap>,
         message: &M,
     ) -> SpClientResult {
+        self.request_with_protobuf_and_options(
+            method,
+            endpoint,
+            headers,
+            message,
+            &Default::default(),
+        )
+        .await
+    }
+
+    pub async fn request_with_protobuf_and_options<M: Message + MessageFull>(
+        &self,
+        method: &Method,
+        endpoint: &str,
+        headers: Option<HeaderMap>,
+        message: &M,
+        options: &RequestOptions,
+    ) -> SpClientResult {
         let body = message.write_to_bytes()?;
 
         let mut headers = headers.unwrap_or_default();
@@ -364,7 +403,7 @@ impl SpClient {
             HeaderValue::from_static("application/x-protobuf"),
         );
 
-        self.request(method, endpoint, Some(headers), Some(&body))
+        self.request_with_options(method, endpoint, Some(headers), Some(&body), options)
             .await
     }
 
@@ -389,6 +428,18 @@ impl SpClient {
         headers: Option<HeaderMap>,
         body: Option<&[u8]>,
     ) -> SpClientResult {
+        self.request_with_options(method, endpoint, headers, body, &Default::default())
+            .await
+    }
+
+    pub async fn request_with_options(
+        &self,
+        method: &Method,
+        endpoint: &str,
+        headers: Option<HeaderMap>,
+        body: Option<&[u8]>,
+        options: &RequestOptions,
+    ) -> SpClientResult {
         let mut tries: usize = 0;
         let mut last_response;
 
@@ -402,25 +453,27 @@ impl SpClient {
             let mut url = self.base_url().await?;
             url.push_str(endpoint);
 
-            let separator = match url.find('?') {
-                Some(_) => "&",
-                None => "?",
-            };
-
             // Add metrics. There is also an optional `partner` key with a value like
             // `vodafone-uk` but we've yet to discover how we can find that value.
             // For the sake of documentation you could also do "product=free" but
             // we only support premium anyway.
-            let _ = write!(
-                url,
-                "{}product=0&country={}",
-                separator,
-                self.session().country()
-            );
+            if options.metrics && !url.contains("product=0") {
+                let _ = write!(
+                    url,
+                    "{}product=0&country={}",
+                    util::get_next_query_separator(&url),
+                    self.session().country()
+                );
+            }
 
             // Defeat caches. Spotify-generated URLs already contain this.
-            if !url.contains("salt=") {
-                let _ = write!(url, "&salt={}", rand::thread_rng().next_u32());
+            if options.salt && !url.contains("salt=") {
+                let _ = write!(
+                    url,
+                    "{}salt={}",
+                    util::get_next_query_separator(&url),
+                    rand::thread_rng().next_u32()
+                );
             }
 
             let mut request = Request::builder()
@@ -484,14 +537,19 @@ impl SpClient {
         last_response
     }
 
-    pub async fn put_connect_state_request(&self, state: PutStateRequest) -> SpClientResult {
+    pub async fn put_connect_state_request(&self, state: &PutStateRequest) -> SpClientResult {
         let endpoint = format!("/connect-state/v1/devices/{}", self.session().device_id());
 
         let mut headers = HeaderMap::new();
         headers.insert(CONNECTION_ID, self.session().connection_id().parse()?);
 
-        self.request_with_protobuf(&Method::PUT, &endpoint, Some(headers), &state)
+        self.request_with_protobuf(&Method::PUT, &endpoint, Some(headers), state)
             .await
+    }
+
+    pub async fn delete_connect_state_request(&self) -> SpClientResult {
+        let endpoint = format!("/connect-state/v1/devices/{}", self.session().device_id());
+        self.request(&Method::DELETE, &endpoint, None, None).await
     }
 
     pub async fn put_connect_state_inactive(&self, notify: bool) -> SpClientResult {
@@ -751,14 +809,40 @@ impl SpClient {
         self.request_url(&url).await
     }
 
+    /// Request the context for an uri
+    ///
+    /// ## Query entry found in the wild:
+    /// - include_video=true
+    /// ## Remarks:
+    /// - track
+    ///   - returns a single page with a single track
+    ///   - when requesting a single track with a query in the request, the returned track uri
+    ///     **will** contain the query
+    /// - artists
+    ///   - returns 2 pages with tracks: 10 most popular tracks and latest/popular album
+    ///   - remaining pages are albums of the artists and are only provided as page_url
+    /// - search
+    ///   - is massively influenced by the provided query
+    ///   - the query result shown by the search expects no query at all
+    ///   - uri looks like "spotify:search:never+gonna"
     pub async fn get_context(&self, uri: &str) -> Result<Context, Error> {
         let uri = format!("/context-resolve/v1/{uri}");
 
-        let res = self.request(&Method::GET, &uri, None, None).await?;
+        let res = self
+            .request_with_options(&Method::GET, &uri, None, None, &NO_METRICS_AND_SALT)
+            .await?;
         let ctx_json = String::from_utf8(res.to_vec())?;
-        let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json)?;
+        if ctx_json.is_empty() {
+            Err(SpClientError::NoData)?
+        }
 
-        Ok(ctx)
+        let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json);
+
+        if ctx.is_err() {
+            trace!("failed parsing context: {ctx_json}")
+        }
+
+        Ok(ctx?)
     }
 
     pub async fn get_autoplay_context(
@@ -766,18 +850,27 @@ impl SpClient {
         context_request: &AutoplayContextRequest,
     ) -> Result<Context, Error> {
         let res = self
-            .request_with_protobuf(
+            .request_with_protobuf_and_options(
                 &Method::POST,
                 "/context-resolve/v1/autoplay",
                 None,
                 context_request,
+                &NO_METRICS_AND_SALT,
             )
             .await?;
 
         let ctx_json = String::from_utf8(res.to_vec())?;
-        let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json)?;
+        if ctx_json.is_empty() {
+            Err(SpClientError::NoData)?
+        }
 
-        Ok(ctx)
+        let ctx = protobuf_json_mapping::parse_from_str::<Context>(&ctx_json);
+
+        if ctx.is_err() {
+            trace!("failed parsing context: {ctx_json}")
+        }
+
+        Ok(ctx?)
     }
 
     pub async fn get_rootlist(&self, from: usize, length: Option<usize>) -> SpClientResult {

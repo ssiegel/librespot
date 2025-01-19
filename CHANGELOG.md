@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- [test] Missing bindgen breaks crossbuild on recent runners. Now installing latest bindgen in addition.
 - [core] Fix "no native root CA certificates found" on platforms unsupported
   by `rustls-native-certs`.
 - [core] Fix all APs rejecting with "TryAnotherAP" when connecting session
@@ -33,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [connect] Fix "play" command not handled if missing "offset" property
 - [discovery] Fix libmdns zerconf setup errors not propagating to the main task.
 - [metadata] `Show::trailer_uri` is now optional since it isn't always present (breaking)
+- [connect] Handle transfer of playback with empty "uri" field
+- [connect] Correctly apply playing/paused state when transferring playback
 
 ### Removed
 

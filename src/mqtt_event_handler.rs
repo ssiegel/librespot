@@ -1,5 +1,4 @@
-
-use librespot_connect::spirc::SpircCommand;
+use librespot_connect::SpircCommand;
 use librespot_playback::player::PlayerEventChannel;
 use log::{info, warn};
 use paho_mqtt;

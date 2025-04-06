@@ -2,7 +2,7 @@ use librespot_connect::SpircCommand;
 use librespot_playback::player::PlayerEventChannel;
 use log::{info, warn};
 use paho_mqtt;
-use std::thread;
+use std::{thread, time::Duration};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Clone)]
@@ -37,12 +37,13 @@ impl MQTTHandler {
         mut player_events: PlayerEventChannel,
         spirc_commands: UnboundedSender<SpircCommand>
     ) {
-
         let subscribe_stream = self.mqtt_client.get_stream(1);
-        thread::spawn(move|| loop {
+        thread::spawn(move || loop {
             if let Some(event) = player_events.blocking_recv() {
                 let event_fields = event.get_player_event_fields().unwrap();
                 self.mqtt_client.publish(paho_mqtt::Message::new(format!("{}/pub", self.topic), serde_json::to_vec(&event_fields).unwrap(), Self::QOS));
+            } else {
+                thread::sleep(Duration::from_millis(500));
             }
         });
         thread::spawn(move || loop {
@@ -56,6 +57,8 @@ impl MQTTHandler {
                         }
                     }
                 }
+            } else {
+                thread::sleep(Duration::from_millis(500));
             }
         });
     }

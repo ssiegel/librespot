@@ -312,6 +312,11 @@ impl PlayerEvent {
                 position_ms,
                 ..
             }
+            | PositionChanged {
+                track_id,
+                position_ms,
+                ..
+            }
             | Seeked {
                 track_id,
                 position_ms,
@@ -383,6 +388,7 @@ impl From<&PlayerEvent> for &str {
             Unavailable { .. } => "unavailable",
             VolumeChanged { .. } => "volume_changed",
             PositionCorrection { .. } => "position_correction",
+            PositionChanged { .. } => "position_changed",
             Seeked { .. } => "seeked",
             TrackChanged { .. } => "track_changed",
             SessionConnected { .. } => "session_connected",

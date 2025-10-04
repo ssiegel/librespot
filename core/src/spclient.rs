@@ -3,8 +3,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::config::{os_version, OS};
+use crate::config::{OS, os_version};
 use crate::{
+    Error, FileId, SpotifyId, SpotifyUri,
     apresolve::SocketAddress,
     config::SessionConfig,
     error::ErrorKind,
@@ -21,15 +22,14 @@ use crate::{
     token::Token,
     util,
     version::spotify_semantic_version,
-    Error, FileId, SpotifyId,
 };
 use bytes::Bytes;
 use data_encoding::HEXUPPER_PERMISSIVE;
 use futures_util::future::IntoStream;
-use http::header::HeaderValue;
+use http::{Uri, header::HeaderValue};
 use hyper::{
-    header::{HeaderName, ACCEPT, AUTHORIZATION, CONTENT_TYPE, RANGE},
     HeaderMap, Method, Request,
+    header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, RANGE},
 };
 use hyper_util::client::legacy::ResponseFuture;
 use protobuf::{Enum, Message, MessageFull};
@@ -56,6 +56,12 @@ const NO_METRICS_AND_SALT: RequestOptions = RequestOptions {
     metrics: false,
     salt: false,
     base_url: None,
+};
+
+const SPCLIENT_FALLBACK_ENDPOINT: RequestOptions = RequestOptions {
+    metrics: true,
+    salt: true,
+    base_url: Some("https://spclient.wg.spotify.com"),
 };
 
 #[derive(Debug, Error)]
@@ -305,20 +311,12 @@ impl SpClient {
                                         continue;
                                     }
                                     Err(e) => {
-                                        trace!(
-                                            "Answer not accepted {}/{}: {}",
-                                            count,
-                                            MAX_TRIES,
-                                            e
-                                        );
+                                        trace!("Answer not accepted {count}/{MAX_TRIES}: {e}");
                                     }
                                 }
                             }
                             Err(e) => trace!(
-                                "Unable to solve hash cash challenge {}/{}: {}",
-                                count,
-                                MAX_TRIES,
-                                e
+                                "Unable to solve hash cash challenge {count}/{MAX_TRIES}: {e}"
                             ),
                         }
 
@@ -337,7 +335,7 @@ impl SpClient {
                 Some(unknown) => {
                     return Err(Error::unimplemented(format!(
                         "Unknown client token response type: {unknown:?}"
-                    )))
+                    )));
                 }
                 None => return Err(Error::failed_precondition("No client token response type")),
             }
@@ -367,7 +365,7 @@ impl SpClient {
             inner.client_token = Some(client_token);
         });
 
-        trace!("Got client token: {:?}", granted_token);
+        trace!("Got client token: {granted_token:?}");
 
         Ok(access_token)
     }
@@ -452,8 +450,8 @@ impl SpClient {
 
             // Reconnection logic: retrieve the endpoint every iteration, so we can try
             // another access point when we are experiencing network issues (see below).
-            let mut url = match &options.base_url {
-                Some(base_url) => base_url.to_owned().to_string(),
+            let mut url = match options.base_url {
+                Some(base_url) => base_url.to_string(),
                 None => self.base_url().await?,
             };
             url.push_str(endpoint);
@@ -477,22 +475,26 @@ impl SpClient {
                     url,
                     "{}salt={}",
                     util::get_next_query_separator(&url),
-                    rand::thread_rng().next_u32()
+                    rand::rng().next_u32()
                 );
             }
 
             let mut request = Request::builder()
                 .method(method)
                 .uri(url)
+                .header(CONTENT_LENGTH, body.len())
                 .body(Bytes::copy_from_slice(body))?;
 
             // Reconnection logic: keep getting (cached) tokens because they might have expired.
             let token = self.session().login5().auth_token().await?;
 
             let headers_mut = request.headers_mut();
-            if let Some(ref hdrs) = headers {
-                *headers_mut = hdrs.clone();
+            if let Some(ref headers) = headers {
+                for (name, value) in headers {
+                    headers_mut.insert(name, value.clone());
+                }
             }
+
             headers_mut.insert(
                 AUTHORIZATION,
                 HeaderValue::from_str(&format!("{} {}", token.token_type, token.access_token,))?,
@@ -536,7 +538,7 @@ impl SpClient {
                 }
             }
 
-            debug!("Error was: {:?}", last_response);
+            debug!("Error was: {last_response:?}");
         }
 
         last_response
@@ -575,12 +577,14 @@ impl SpClient {
         // For unknown reasons, metadata requests must now be sent through spclient.wg.spotify.com.
         // Otherwise, the API will respond with 500 Internal Server Error responses.
         // Context: https://github.com/librespot-org/librespot/issues/1527
-        let options = RequestOptions {
-            base_url: Some("https://spclient.wg.spotify.com"),
-            ..Default::default()
-        };
-        self.request_with_options(&Method::GET, &endpoint, None, None, &options)
-            .await
+        self.request_with_options(
+            &Method::GET,
+            &endpoint,
+            None,
+            None,
+            &SPCLIENT_FALLBACK_ENDPOINT,
+        )
+        .await
     }
 
     pub async fn get_track_metadata(&self, track_id: &SpotifyId) -> SpClientResult {
@@ -672,10 +676,10 @@ impl SpClient {
             .await
     }
 
-    pub async fn get_radio_for_track(&self, track_id: &SpotifyId) -> SpClientResult {
+    pub async fn get_radio_for_track(&self, track_uri: &SpotifyUri) -> SpClientResult {
         let endpoint = format!(
             "/inspiredby-mix/v2/seed_to_playlist/{}?response-format=json",
-            track_id.to_uri()?
+            track_uri.to_uri()?
         );
 
         self.request_as_json(&Method::GET, &endpoint, None, None)
@@ -743,12 +747,16 @@ impl SpClient {
         self.request(&Method::GET, &endpoint, None, None).await
     }
 
-    pub fn stream_from_cdn(
+    pub fn stream_from_cdn<U>(
         &self,
-        cdn_url: &str,
+        cdn_url: U,
         offset: usize,
         length: usize,
-    ) -> Result<IntoStream<ResponseFuture>, Error> {
+    ) -> Result<IntoStream<ResponseFuture>, Error>
+    where
+        U: TryInto<Uri>,
+        <U as TryInto<Uri>>::Error: Into<http::Error>,
+    {
         let req = Request::builder()
             .method(&Method::GET)
             .uri(cdn_url)
@@ -888,7 +896,9 @@ impl SpClient {
     pub async fn get_rootlist(&self, from: usize, length: Option<usize>) -> SpClientResult {
         let length = length.unwrap_or(120);
         let user = self.session().username();
-        let endpoint = format!("/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={from}&length={length}");
+        let endpoint = format!(
+            "/playlist/v2/user/{user}/rootlist?decorate=revision,attributes,length,owner,capabilities,status_code&from={from}&length={length}"
+        );
 
         self.request(&Method::GET, &endpoint, None, None).await
     }

@@ -138,6 +138,7 @@ enum PlayerCommand {
         track: bool,
     },
     EmitAutoPlayChangedEvent(bool),
+    EmitAddedToQueueEvent(SpotifyUri),
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +146,9 @@ pub enum PlayerEvent {
     // Play request id changed
     PlayRequestIdChanged {
         play_request_id: u64,
+    },
+    AddedToQueue {
+        track_id: SpotifyUri,
     },
     // Fired when the player is stopped (e.g. by issuing a "stop" command to the player).
     Stopped {
@@ -292,14 +296,15 @@ impl PlayerEvent {
         fields.insert("player_event", player_event.to_string());
         match self {
             PlayRequestIdChanged { .. } => (),
-            Stopped { track_id, .. }
+            AddedToQueue { track_id }
+            | Stopped { track_id, .. }
             | Preloading { track_id }
             | TimeToPreloadNextTrack { track_id, .. }
             | EndOfTrack { track_id, .. }
             | Unavailable { track_id, .. } => {
                 let item_type: &str = track_id.item_type().into();
                 fields.insert("audio_type", item_type.to_string());
-                fields.insert("track_id", track_id.to_id()?);
+                fields.insert("track_id", track_id.to_id());
             }
             Loading {
                 track_id,
@@ -333,7 +338,7 @@ impl PlayerEvent {
             } => {
                 let audio_type: &str = track_id.item_type().into();
                 fields.insert("audio_type", audio_type.to_string());
-                fields.insert("track_id", track_id.to_id()?);
+                fields.insert("track_id", track_id.to_id());
                 fields.insert("position_ms", position_ms.to_string());
             }
             VolumeChanged { volume } => {
@@ -387,6 +392,7 @@ impl From<&PlayerEvent> for &str {
         use crate::player::PlayerEvent::*;
         match player_event {
             PlayRequestIdChanged { .. } => "play_request_id_changed",
+            AddedToQueue { .. } => "added_to_queue",
             Stopped { .. } => "stopped",
             Loading { .. } => "loading",
             Preloading { .. } => "preloading",
@@ -772,6 +778,10 @@ impl Player {
     pub fn emit_auto_play_changed_event(&self, auto_play: bool) {
         self.command(PlayerCommand::EmitAutoPlayChangedEvent(auto_play));
     }
+
+    pub fn emit_added_to_queue_event(&self, track_id: SpotifyUri) {
+        self.command(PlayerCommand::EmitAddedToQueueEvent(track_id));
+    }
 }
 
 impl Drop for Player {
@@ -1113,10 +1123,7 @@ impl PlayerTrackLoader {
             Ok(audio) => match self.find_available_alternative(audio).await {
                 Some(audio) => audio,
                 None => {
-                    warn!(
-                        "spotify:track:<{}> is not available",
-                        track_id.to_base62().unwrap_or_default()
-                    );
+                    warn!("spotify:track:<{}> is not available", track_id.to_base62());
                     return None;
                 }
             },
@@ -1415,7 +1422,7 @@ impl PlayerTrackLoader {
             is_explicit: false,
             audio_item: AudioItem {
                 duration_ms: duration.as_millis() as u32,
-                uri: track_uri.to_uri().unwrap_or_default(),
+                uri: track_uri.to_uri(),
                 track_id: track_uri,
                 files: Default::default(),
                 name,
@@ -2463,6 +2470,10 @@ impl PlayerInternal {
                 self.auto_normalise_as_album = setting
             }
 
+            PlayerCommand::EmitAddedToQueueEvent(track_id) => {
+                self.send_event(PlayerEvent::AddedToQueue { track_id })
+            }
+
             PlayerCommand::EmitFilterExplicitContentChangedEvent(filter) => {
                 self.send_event(PlayerEvent::FilterExplicitContentChanged { filter });
 
@@ -2663,6 +2674,10 @@ impl fmt::Debug for PlayerCommand {
             PlayerCommand::EmitAutoPlayChangedEvent(auto_play) => f
                 .debug_tuple("EmitAutoPlayChangedEvent")
                 .field(&auto_play)
+                .finish(),
+            PlayerCommand::EmitAddedToQueueEvent(track_id) => f
+                .debug_tuple("EmitAddedToQueueEvent")
+                .field(&track_id)
                 .finish(),
         }
     }
